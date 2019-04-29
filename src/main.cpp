@@ -26,8 +26,20 @@ inline std::uint64_t rdtsc() {
 struct node {
     node* m_next;
     node* m_prev;
+#ifdef TEST_N3
+    char m_padding[64 - sizeof(node*) * 2 - sizeof(std::uint32_t)];
     std::uint32_t m_data;
+#elif defined(TEST_N2)
+    std::uint32_t m_data;
+    char m_padding[64 - sizeof(node*) * 2 - sizeof(std::uint32_t)];
+#else // TEST_N1
+    std::uint32_t m_data;
+#endif
 };
+
+#if defined(TEST_N3) || defined(TEST_N2)
+static_assert(sizeof(node) == 64, "sizeof(node)");
+#endif
 
 // Swap locations of two nodes in a double-linked list
 void swap(node& n1, node& n2) {
