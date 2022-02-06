@@ -1,6 +1,8 @@
+// vim: textwidth=100
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <iostream>
@@ -12,6 +14,8 @@
 #include <numeric>
 #include <vector>
 #include <memory>
+
+#include <getopt.h>
 
 /*
  * The test is dedicated for checking how memory access time depends on used working set size.
@@ -110,39 +114,86 @@ bool set_thread_affinity(unsigned short cpuid) {
     return pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set) == 0;
 }
 
+double get_cpu_freq_ghz() {
+    using fp_seconds_t =
+        std::chrono::duration<double, std::chrono::seconds::period>;
+
+    auto get_freq_hz = [](){
+        auto time_pt = std::chrono::high_resolution_clock::now();
+        std::uint64_t end_ts, start_ts = rdtsc();
+        do {
+            end_ts = rdtsc();
+        } while (end_ts - start_ts < 1'000'000);
+        return (end_ts - start_ts) /
+            fp_seconds_t(std::chrono::high_resolution_clock::now() - time_pt).count();
+    };
+
+    double freq_prev, freq = get_freq_hz();
+    do {
+        freq_prev = freq;
+        freq = get_freq_hz();
+    } while (std::abs(freq - freq_prev) > 1000.0);
+
+    return freq / 1'000'000'000.0;
+}
+
 int main(int argc, char* argv[]) {
     using namespace std::string_view_literals;
 
     unsigned short cpuid = 1;
+    bool go_parse = true;
+    const char* prog_name = argv[0];
+    struct option long_opts[] = {{"help", 0, nullptr, 'h'}, {}};
 
-    for (int i = 1; i < argc; ++i) {
-        if ("-c"sv == argv[i] && i + 1 < argc) {
-            std::istringstream is{argv[++i]};
+    if (auto p = std::strrchr(prog_name, '/'))
+        prog_name = p + 1;
+
+    while (go_parse)
+        switch (getopt_long(argc, argv, "c:h", long_opts, nullptr)) {
+        case 'h':
+            std::cout << prog_name << " [OPTIONS]\n\n"
+                "The program allows to measure average access time to memory depending on\n"
+                "used working set size.\n\n"
+                "Options:\n"
+                "  -h, --help - this help message\n"
+                "  -c N       - bind to cpu N (default: 1)"sv
+                << std::endl;
+            return 0;
+        case 'c': {
+            std::istringstream is{optarg};
             is >> cpuid;
             if (is.bad() || is.fail()) {
                 std::cerr << "unable to convert cpuid into an acceptable number"sv << std::endl;
                 return 1;
             }
-        } else {
-            std::cerr << "unexpected parameters at command line"sv << std::endl;
+            break;
+        }
+        case -1:
+            if (optind < argc) {
+                std::cerr << "unexpected positional parameters at command line"sv << std::endl;
+                return 1;
+            }
+            go_parse = false;
+            break;
+        case '?':
             return 1;
         }
-    }
 
     if (! set_thread_affinity(cpuid))
         std::cerr << "unable to bound to cpuid "sv << cpuid << std::endl;
     else
         std::cout << "bound to cpuid=" << cpuid << '\n';
 
+    const auto cpu_freq = get_cpu_freq_ghz();
     const std::size_t max_working_set_size = 128*1024*1024ul;
-    const int print_col_size = 12;
+    const int print_col_size = 16;
     auto container_size = max_working_set_size / sizeof(node);
     std::unique_ptr<node[]> container{new node[container_size]};
 
     std::cout.precision(3);
     std::cout << std::fixed;
 
-    auto run_and_print_test = [](std::size_t working_set_size, node* container){
+    auto run_and_print_test = [cpu_freq](std::size_t working_set_size, node* container){
             auto elements = working_set_size / sizeof(node);
             if (elements) {
                 auto res = test(container, elements);
@@ -150,6 +201,8 @@ int main(int argc, char* argv[]) {
                     << std::setw(print_col_size) << elements * sizeof(node)
                     << std::setw(print_col_size) << res.first
                     << std::setw(print_col_size) << res.second
+                    << std::setw(print_col_size) << res.first / cpu_freq
+                    << std::setw(print_col_size) << res.second / cpu_freq
                     << std::endl;
             }
         };
@@ -157,8 +210,10 @@ int main(int argc, char* argv[]) {
     std::cout
         << "trying randomly accessed wheel with nodes of size="sv << sizeof(node) << "\n\n"
         << std::setw(print_col_size) << "working set"sv
-        << std::setw(print_col_size) << "mean"sv
-        << std::setw(print_col_size) << "median"sv << '\n';
+        << std::setw(print_col_size) << "mean, cycles"sv
+        << std::setw(print_col_size) << "median, cycles"sv
+        << std::setw(print_col_size) << "mean, ns"sv
+        << std::setw(print_col_size) << "median, ns"sv << '\n';
 
     for (std::size_t working_set_size = 16; working_set_size <= max_working_set_size; working_set_size <<= 1) {
         run_and_print_test(working_set_size, container.get());
