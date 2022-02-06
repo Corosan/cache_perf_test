@@ -1,48 +1,46 @@
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <iostream>
+#include <sstream>
 #include <iomanip>
 #include <chrono>
 #include <random>
 #include <algorithm>
 #include <numeric>
+#include <vector>
+#include <memory>
 
 /*
  * The test is dedicated for checking how memory access time depends on used working set size.
- * Double-linked list is built on a continuous block of memory, then nodes are randomly swpped.
+ * Double-linked list is built on a continuous block of memory, then nodes are randomly swapped.
  * During the test the list is traversed and each node's value is read from.
  */
 
-const unsigned attempts = 10'000'000;
-const std::size_t max_working_set_size = 256 * 1024 * 1024;
+constexpr std::size_t s_cache_line_size = 64;
 
 inline std::uint64_t rdtsc() {
-    unsigned int lo, hi;
-    asm volatile ( "rdtsc\n" : "=a" (lo), "=d" (hi) );
-    return ((std::uint64_t)hi << 32) | lo;
+    std::uint64_t res;
+    asm volatile ("rdtsc\n"
+                  "shl $32, %%rdx\n"
+                  "or %%rdx, %0\n"
+                  : "=a" (res)
+                  :
+                  : "cc", "rdx");
+    return res;
 }
 
 struct node {
     node* m_next;
     node* m_prev;
-#ifdef TEST_N3
-    char m_padding[64 - sizeof(node*) * 2 - sizeof(std::uint32_t)];
     std::uint32_t m_data;
-#elif defined(TEST_N2)
-    std::uint32_t m_data;
-    char m_padding[64 - sizeof(node*) * 2 - sizeof(std::uint32_t)];
-#else // TEST_N1
-    std::uint32_t m_data;
-#endif
+    char m_padding[s_cache_line_size - sizeof(node*) * 2 - sizeof(m_data)];
 };
 
-#if defined(TEST_N3) || defined(TEST_N2)
-static_assert(sizeof(node) == 64, "sizeof(node)");
-#endif
-
 // Swap locations of two nodes in a double-linked list
-void swap(node& n1, node& n2) {
+void swap_nodes(node& n1, node& n2) {
     using std::swap;
 
     swap(n1.m_prev->m_next, n2.m_prev->m_next);
@@ -51,65 +49,121 @@ void swap(node& n1, node& n2) {
     swap(n1.m_next, n2.m_next);
 }
 
-double test(node* container, std::size_t elements_count) {
+// returns mean and median
+std::pair<double, double> test(node* container, std::size_t elements_count) {
     if (elements_count < 2)
-        return 0.0;
+        return {};
 
-    {
-        // build double-linked list from elements in the container
-        container[0].m_next = container + 1;
-        container[0].m_prev = container + elements_count - 1;
-        container[elements_count-1].m_next = container;
-        container[elements_count-1].m_prev = container + elements_count - 2;
+    // build double-linked wheel from elements in the container
+    container[0].m_next = container + 1;
+    container[0].m_prev = container + elements_count - 1;
+    container[elements_count-1].m_next = container;
+    container[elements_count-1].m_prev = container + elements_count - 2;
 
-        for (node* ptr = container + 1; ptr != container + elements_count - 1; ++ptr) {
-            ptr->m_next = ptr + 1;
-            ptr->m_prev = ptr - 1;
-        }
+    for (node* ptr = container + 1; ptr != container + elements_count - 1; ++ptr) {
+        ptr->m_next = ptr + 1;
+        ptr->m_prev = ptr - 1;
     }
 
-    {
-        // randomize elements location in the list
-        std::random_device rd;
-        std::mt19937 r(rd());
+    // randomize location of elements in the wheel keeping it's structure
+    std::random_device rd;
+    std::mt19937 r(rd());
 
-        typedef std::uniform_int_distribution<std::size_t> ud_t;
-        ud_t ud;
+    typedef std::uniform_int_distribution<std::size_t> ud_t;
+    ud_t ud;
 
-        for (auto ix = elements_count - 1; ix > 0; --ix)
-            swap(container[ud(r, ud_t::param_type{0, ix - 1})], container[ix]);
-    }
+    for (auto ix = elements_count - 1; ix > 0; --ix)
+        swap_nodes(container[ud(r, ud_t::param_type{0, ix - 1})], container[ix]);
 
-    // hope reading into this variable will not be optimized out
+    // Providing an not-to-be-optimized-out destination for traversing over the
+    // wheel and read data into else a clever compiler can throw out the whole
+    // testing cycle at all.
     static volatile std::uint32_t tmp_destination;
 
-    auto start = rdtsc(); //std::chrono::steady_clock::now();
+    const std::size_t experiments_count = 20;
+    const std::size_t wheel_walking_count = 20;
+    std::vector<double> samples(experiments_count);
 
-    node* p = container;
-    for (unsigned i = 0; i < attempts; ++i) {
-        tmp_destination = p->m_data;
-        p = p->m_next;
+    for (auto& sample : samples) {
+        const auto hopes = elements_count * wheel_walking_count;
+        node* p = &container[ud(r, ud_t::param_type{0, elements_count - 1})];
+        const auto start = rdtsc();
+
+        for (std::size_t i = 0; i < hopes; ++i) {
+            tmp_destination = p->m_data;
+            p = p->m_next;
+        }
+
+        sample = static_cast<double>(rdtsc() - start) / hopes;
     }
 
-    return static_cast<double>(rdtsc() - start) / attempts; //std::chrono::steady_clock::now() - start;
+    sort(begin(samples), end(samples));
+    return {
+        std::accumulate(begin(samples), end(samples), 0.0) / samples.size(),
+        samples[samples.size()/2]};
+}
+
+bool set_thread_affinity(unsigned short cpuid) {
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    CPU_SET(cpuid, &cpu_set);
+    return pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set) == 0;
 }
 
 int main(int argc, char* argv[]) {
+    using namespace std::string_view_literals;
+
+    unsigned short cpuid = 1;
+
+    for (int i = 1; i < argc; ++i) {
+        if ("-c"sv == argv[i] && i + 1 < argc) {
+            std::istringstream is{argv[++i]};
+            is >> cpuid;
+            if (is.bad() || is.fail()) {
+                std::cerr << "unable to convert cpuid into an acceptable number"sv << std::endl;
+                return 1;
+            }
+        } else {
+            std::cerr << "unexpected parameters at command line"sv << std::endl;
+            return 1;
+        }
+    }
+
+    if (! set_thread_affinity(cpuid))
+        std::cerr << "unable to bound to cpuid "sv << cpuid << std::endl;
+    else
+        std::cout << "bound to cpuid=" << cpuid << '\n';
+
+    const std::size_t max_working_set_size = 128*1024*1024ul;
+    const int print_col_size = 12;
     auto container_size = max_working_set_size / sizeof(node);
-    node* container = new node[container_size];
-    std::memset(container, 0, sizeof(node) * container_size);
+    std::unique_ptr<node[]> container{new node[container_size]};
 
     std::cout.precision(3);
     std::cout << std::fixed;
 
+    auto run_and_print_test = [](std::size_t working_set_size, node* container){
+            auto elements = working_set_size / sizeof(node);
+            if (elements) {
+                auto res = test(container, elements);
+                std::cout
+                    << std::setw(print_col_size) << elements * sizeof(node)
+                    << std::setw(print_col_size) << res.first
+                    << std::setw(print_col_size) << res.second
+                    << std::endl;
+            }
+        };
+
+    std::cout
+        << "trying randomly accessed wheel with nodes of size="sv << sizeof(node) << "\n\n"
+        << std::setw(print_col_size) << "working set"sv
+        << std::setw(print_col_size) << "mean"sv
+        << std::setw(print_col_size) << "median"sv << '\n';
+
     for (std::size_t working_set_size = 16; working_set_size <= max_working_set_size; working_set_size <<= 1) {
-        auto elements = working_set_size / sizeof(node);
-        if (elements > 0)
-            std::cout
-                << std::setw(12) << working_set_size
-                << std::setw(12) << test(container, elements) << std::endl;
+        run_and_print_test(working_set_size, container.get());
+        run_and_print_test(((working_set_size << 1) + working_set_size) >> 1, container.get());
     }
 
-    delete[] container;
     return 0;
 }
