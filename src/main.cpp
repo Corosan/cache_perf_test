@@ -43,6 +43,8 @@ struct node {
     char m_padding[s_cache_line_size - sizeof(node*) * 2 - sizeof(m_data)];
 };
 
+static_assert(sizeof(node) == s_cache_line_size);
+
 // Swap locations of two nodes in a double-linked list
 void swap_nodes(node& n1, node& n2) {
     using std::swap;
@@ -79,7 +81,7 @@ std::pair<double, double> test(node* container, std::size_t elements_count) {
     for (auto ix = elements_count - 1; ix > 0; --ix)
         swap_nodes(container[ud(r, ud_t::param_type{0, ix - 1})], container[ix]);
 
-    // Providing an not-to-be-optimized-out destination for traversing over the
+    // Providing a not-to-be-optimized-out destination for traversing over the
     // wheel and read data into else a clever compiler can throw out the whole
     // testing cycle at all.
     static volatile std::uint32_t tmp_destination;
@@ -140,25 +142,37 @@ double get_cpu_freq_ghz() {
 int main(int argc, char* argv[]) {
     using namespace std::string_view_literals;
 
+    std::size_t max_working_set_size = 128;
     unsigned short cpuid = 1;
     bool go_parse = true;
     const char* prog_name = argv[0];
-    struct option long_opts[] = {{"help", 0, nullptr, 'h'}, {}};
+    struct option long_opts[] = {{"help", 0, nullptr, 'h'},
+        {"cpu", 1, nullptr, 'c'}, {"working-set", 1, nullptr, 'w'}, {}};
 
     if (auto p = std::strrchr(prog_name, '/'))
         prog_name = p + 1;
 
     while (go_parse)
-        switch (getopt_long(argc, argv, "c:h", long_opts, nullptr)) {
+        switch (getopt_long(argc, argv, "c:w:h", long_opts, nullptr)) {
         case 'h':
             std::cout << prog_name << " [OPTIONS]\n\n"
                 "The program allows to measure average access time to memory depending on\n"
                 "used working set size.\n\n"
                 "Options:\n"
-                "  -h, --help - this help message\n"
-                "  -c N       - bind to cpu N (default: 1)"sv
+                "  -h, --help          - this help message\n"
+                "  -c, --cpu N         - bind to cpu N (default: 1)\n"
+                "  -w, --working-set N - max working set size in Mb (default: 128)"sv
                 << std::endl;
             return 0;
+        case 'w': {
+            std::istringstream is{optarg};
+            is >> max_working_set_size;
+            if (is.bad() || is.fail()) {
+                std::cerr << "unable to convert max working set size into an acceptable number"sv << std::endl;
+                return 1;
+            }
+            break;
+        }
         case 'c': {
             std::istringstream is{optarg};
             is >> cpuid;
@@ -184,8 +198,8 @@ int main(int argc, char* argv[]) {
     else
         std::cout << "bound to cpuid=" << cpuid << '\n';
 
+    max_working_set_size *= 1024*1024ul;
     const auto cpu_freq = get_cpu_freq_ghz();
-    const std::size_t max_working_set_size = 128*1024*1024ul;
     const int print_col_size = 16;
     auto container_size = max_working_set_size / sizeof(node);
     std::unique_ptr<node[]> container{new node[container_size]};
@@ -215,9 +229,11 @@ int main(int argc, char* argv[]) {
         << std::setw(print_col_size) << "mean, ns"sv
         << std::setw(print_col_size) << "median, ns"sv << '\n';
 
-    for (std::size_t working_set_size = 16; working_set_size <= max_working_set_size; working_set_size <<= 1) {
-        run_and_print_test(working_set_size, container.get());
-        run_and_print_test(((working_set_size << 1) + working_set_size) >> 1, container.get());
+    for (std::size_t ws_size = s_cache_line_size * 2; ws_size <= max_working_set_size; ws_size <<= 1) {
+        run_and_print_test(ws_size, container.get());
+        auto next_ws_size = ws_size * 3 / 2;
+        if (next_ws_size <= max_working_set_size)
+            run_and_print_test(next_ws_size, container.get());
     }
 
     return 0;
