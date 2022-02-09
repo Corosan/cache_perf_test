@@ -146,7 +146,7 @@ int main(int argc, char* argv[]) {
     unsigned short cpuid = 1;
     bool go_parse = true;
     const char* prog_name = argv[0];
-    struct option long_opts[] = {{"help", 0, nullptr, 'h'},
+    const struct option long_opts[] = {{"help", 0, nullptr, 'h'},
         {"cpu", 1, nullptr, 'c'}, {"working-set", 1, nullptr, 'w'}, {}};
 
     if (auto p = std::strrchr(prog_name, '/'))
@@ -193,10 +193,10 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-    if (! set_thread_affinity(cpuid))
+    if (! set_thread_affinity(cpuid)) {
         std::cerr << "unable to bound to cpuid "sv << cpuid << std::endl;
-    else
-        std::cout << "bound to cpuid=" << cpuid << '\n';
+        return 2;
+    }
 
     max_working_set_size *= 1024*1024ul;
     const auto cpu_freq = get_cpu_freq_ghz();
@@ -221,13 +221,16 @@ int main(int argc, char* argv[]) {
             }
         };
 
-    std::cout
-        << "trying randomly accessed wheel with nodes of size="sv << sizeof(node) << "\n\n"
-        << std::setw(print_col_size) << "working set"sv
-        << std::setw(print_col_size) << "mean, cycles"sv
-        << std::setw(print_col_size) << "median, cycles"sv
-        << std::setw(print_col_size) << "mean, ns"sv
-        << std::setw(print_col_size) << "median, ns"sv << '\n';
+    std::cout <<
+        "tsc frequency, Ghz       : " << cpu_freq << "\n"
+        "working set size, Mb     : " << max_working_set_size / 1024 / 1024 << "\n"
+        "single data item size, b : " << sizeof(node) << "\n"
+        "--------------------------------------\n" <<
+        std::setw(print_col_size) << "working set"sv <<
+        std::setw(print_col_size) << "mean, cycles"sv <<
+        std::setw(print_col_size) << "median, cycles"sv <<
+        std::setw(print_col_size) << "mean, ns"sv <<
+        std::setw(print_col_size) << "median, ns"sv << '\n';
 
     for (std::size_t ws_size = s_cache_line_size * 2; ws_size <= max_working_set_size; ws_size <<= 1) {
         run_and_print_test(ws_size, container.get());
